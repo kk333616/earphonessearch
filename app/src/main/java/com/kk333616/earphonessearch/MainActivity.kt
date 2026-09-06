@@ -138,15 +138,16 @@ class MainActivity : Activity() {
 
         content.addView(TextView(this).apply {
             text = """
-                
+
                 探索音の動作
                 ・0〜6秒：メディア音量 30%
                 ・6〜12秒：50%
                 ・12〜18秒：70%
                 ・18秒以降：100%
                 ・2.2kHz / 3.2kHz の高めの音を交互に再生
-                
-                現在のバージョンでは、Androidがメディア出力先として認識しているBluetoothイヤホンが接続中の場合に使用できます。
+
+                Androidで現在選択されているメディア出力先を使用します。
+                Bluetoothイヤホンをスマホの音声出力先にした状態で開始してください。
                 ケースに入って接続が切れている場合や、イヤホンの電池が切れている場合は音を鳴らせません。
             """.trimIndent()
             textSize = 14f
@@ -206,8 +207,7 @@ class MainActivity : Activity() {
     private fun startSearchSound() {
         if (searching.get()) return
 
-        val bluetoothDevice = findBluetoothOutput()
-        if (bluetoothDevice == null) {
+        if (findBluetoothOutput() == null) {
             Toast.makeText(
                 this,
                 "Bluetoothイヤホンが接続されていません",
@@ -228,13 +228,27 @@ class MainActivity : Activity() {
                 sampleRate,
                 AudioFormat.CHANNEL_OUT_MONO,
                 AudioFormat.ENCODING_PCM_16BIT
-            ).coerceAtLeast(sampleRate / 2)
+            )
+
+            if (minBuffer <= 0) {
+                mainHandler.post {
+                    Toast.makeText(this, "音声出力を初期化できませんでした", Toast.LENGTH_LONG).show()
+                }
+                searching.set(false)
+                restoreOriginalVolume()
+                mainHandler.post {
+                    startButton.isEnabled = true
+                    stopButton.isEnabled = false
+                    updateCurrentVolumeText()
+                }
+                return@Thread
+            }
 
             val track = AudioTrack.Builder()
                 .setAudioAttributes(
                     AudioAttributes.Builder()
                         .setUsage(AudioAttributes.USAGE_MEDIA)
-                        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
                         .build()
                 )
                 .setAudioFormat(
@@ -251,7 +265,14 @@ class MainActivity : Activity() {
             currentTrack = track
 
             try {
-                track.setPreferredDevice(bluetoothDevice)
+                if (track.state != AudioTrack.STATE_INITIALIZED) {
+                    throw IllegalStateException("AudioTrack initialization failed")
+                }
+
+                // BluetoothイヤホンがAndroidのメディア出力先になっている場合、
+                // Androidの通常のメディアルーティングに任せる方が機種差に強い。
+                // setPreferredDevice()で特定のBluetoothプロファイルを強制しない。
+                setSystemMediaVolume(0.30f)
                 track.play()
 
                 val startTime = System.currentTimeMillis()
@@ -280,7 +301,10 @@ class MainActivity : Activity() {
                         silenceMs = 170
                     )
 
-                    track.write(beep, 0, beep.size, AudioTrack.WRITE_BLOCKING)
+                    val written = track.write(beep, 0, beep.size, AudioTrack.WRITE_BLOCKING)
+                    if (written < 0) {
+                        throw IllegalStateException("AudioTrack write failed: $written")
+                    }
                     beepIndex++
                 }
             } catch (_: Exception) {
@@ -327,9 +351,9 @@ class MainActivity : Activity() {
         val beepSamples = sampleRate * beepMs / 1000
         val silenceSamples = sampleRate * silenceMs / 1000
         val result = ShortArray(beepSamples + silenceSamples)
+        val fadeSamples = (sampleRate * 0.015).roundToInt().coerceAtLeast(1)
 
         for (i in 0 until beepSamples) {
-            val fadeSamples = (sampleRate * 0.015).roundToInt().coerceAtLeast(1)
             val fadeIn = (i.toFloat() / fadeSamples).coerceIn(0f, 1f)
             val fadeOut = ((beepSamples - i).toFloat() / fadeSamples).coerceIn(0f, 1f)
             val envelope = minOf(fadeIn, fadeOut)
