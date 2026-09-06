@@ -4,9 +4,8 @@ import android.app.Activity
 import android.media.AudioAttributes
 import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
-import android.media.AudioFormat
 import android.media.AudioManager
-import android.media.AudioTrack
+import android.media.MediaPlayer
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -18,6 +17,10 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import java.io.File
+import java.io.FileOutputStream
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.PI
 import kotlin.math.roundToInt
@@ -28,6 +31,7 @@ class MainActivity : Activity() {
     private lateinit var audioManager: AudioManager
     private lateinit var statusText: TextView
     private lateinit var volumeText: TextView
+    private lateinit var playbackText: TextView
     private lateinit var startButton: Button
     private lateinit var stopButton: Button
 
@@ -35,9 +39,13 @@ class MainActivity : Activity() {
     private val searching = AtomicBoolean(false)
 
     @Volatile
-    private var currentTrack: AudioTrack? = null
+    private var currentPlayer: MediaPlayer? = null
+
+    @Volatile
+    private var volumeThread: Thread? = null
 
     private var originalMediaVolume: Int? = null
+    private var toneFile: File? = null
 
     private val audioDeviceCallback = object : AudioDeviceCallback() {
         override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>) {
@@ -117,6 +125,13 @@ class MainActivity : Activity() {
         }
         content.addView(volumeText)
 
+        playbackText = TextView(this).apply {
+            text = "再生状態：停止中"
+            textSize = 14f
+            setPadding(0, dp(4), 0, dp(14))
+        }
+        content.addView(playbackText)
+
         content.addView(TextView(this).apply {
             text = "注意：探索中は最大音量まで上がります。イヤホンを耳に装着した状態では開始しないでください。停止すると開始前のメディア音量へ戻します。"
             textSize = 14f
@@ -146,7 +161,7 @@ class MainActivity : Activity() {
                 ・18秒以降：100%
                 ・2.2kHz / 3.2kHz の高めの音を交互に再生
 
-                Androidで現在選択されているメディア出力先を使用します。
+                Androidの通常のメディア再生経路を使用します。
                 Bluetoothイヤホンをスマホの音声出力先にした状態で開始してください。
                 ケースに入って接続が切れている場合や、イヤホンの電池が切れている場合は音を鳴らせません。
             """.trimIndent()
@@ -221,62 +236,46 @@ class MainActivity : Activity() {
         searching.set(true)
         startButton.isEnabled = false
         stopButton.isEnabled = true
+        playbackText.text = "再生状態：探索音を準備中"
 
-        Thread {
-            val sampleRate = 44_100
-            val minBuffer = AudioTrack.getMinBufferSize(
-                sampleRate,
-                AudioFormat.CHANNEL_OUT_MONO,
-                AudioFormat.ENCODING_PCM_16BIT
-            )
+        try {
+            val file = createSearchToneWav()
+            toneFile = file
 
-            if (minBuffer <= 0) {
-                mainHandler.post {
-                    Toast.makeText(this, "音声出力を初期化できませんでした", Toast.LENGTH_LONG).show()
-                }
-                searching.set(false)
-                restoreOriginalVolume()
-                mainHandler.post {
-                    startButton.isEnabled = true
-                    stopButton.isEnabled = false
-                    updateCurrentVolumeText()
-                }
-                return@Thread
-            }
-
-            val track = AudioTrack.Builder()
-                .setAudioAttributes(
+            val player = MediaPlayer().apply {
+                setAudioAttributes(
                     AudioAttributes.Builder()
                         .setUsage(AudioAttributes.USAGE_MEDIA)
                         .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
                         .build()
                 )
-                .setAudioFormat(
-                    AudioFormat.Builder()
-                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                        .setSampleRate(sampleRate)
-                        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                        .build()
-                )
-                .setBufferSizeInBytes(minBuffer * 2)
-                .setTransferMode(AudioTrack.MODE_STREAM)
-                .build()
+                setDataSource(file.absolutePath)
+                isLooping = true
+                setVolume(1.0f, 1.0f)
+                prepare()
+            }
 
-            currentTrack = track
+            currentPlayer = player
+            setSystemMediaVolume(0.30f)
+            player.start()
+            playbackText.text = "再生状態：再生中"
 
-            try {
-                if (track.state != AudioTrack.STATE_INITIALIZED) {
-                    throw IllegalStateException("AudioTrack initialization failed")
+            mainHandler.postDelayed({
+                val activePlayer = currentPlayer
+                if (searching.get() && activePlayer != null) {
+                    val route = activePlayer.routedDevice
+                    val routeName = route?.productName?.toString()?.takeIf { it.isNotBlank() }
+                    playbackText.text = if (routeName != null) {
+                        "再生状態：再生中 / 出力先：$routeName"
+                    } else {
+                        "再生状態：再生中 / 出力先：Androidのメディア出力"
+                    }
                 }
+            }, 800L)
 
-                // BluetoothイヤホンがAndroidのメディア出力先になっている場合、
-                // Androidの通常のメディアルーティングに任せる方が機種差に強い。
-                // setPreferredDevice()で特定のBluetoothプロファイルを強制しない。
-                setSystemMediaVolume(0.30f)
-                track.play()
-
+            val thread = Thread {
                 val startTime = System.currentTimeMillis()
-                var beepIndex = 0
+                var lastPercent = -1
 
                 while (searching.get()) {
                     val elapsed = System.currentTimeMillis() - startTime
@@ -287,82 +286,92 @@ class MainActivity : Activity() {
                         else -> 1.00f
                     }
 
-                    setSystemMediaVolume(targetVolume)
                     val percent = (targetVolume * 100).roundToInt()
-                    mainHandler.post {
-                        volumeText.text = "探索中：メディア音量 $percent%"
+                    if (percent != lastPercent) {
+                        setSystemMediaVolume(targetVolume)
+                        lastPercent = percent
+                        mainHandler.post {
+                            volumeText.text = "探索中：メディア音量 $percent%"
+                        }
                     }
 
-                    val frequency = if (beepIndex % 2 == 0) 2200.0 else 3200.0
-                    val beep = makeBeepBuffer(
-                        sampleRate = sampleRate,
-                        frequencyHz = frequency,
-                        beepMs = 430,
-                        silenceMs = 170
-                    )
-
-                    val written = track.write(beep, 0, beep.size, AudioTrack.WRITE_BLOCKING)
-                    if (written < 0) {
-                        throw IllegalStateException("AudioTrack write failed: $written")
+                    try {
+                        Thread.sleep(200L)
+                    } catch (_: InterruptedException) {
+                        break
                     }
-                    beepIndex++
-                }
-            } catch (_: Exception) {
-                mainHandler.post {
-                    Toast.makeText(
-                        this,
-                        "探索音の再生中にエラーが発生しました",
-                        Toast.LENGTH_LONG
-                    ).show()
-                }
-            } finally {
-                try {
-                    track.pause()
-                    track.flush()
-                    track.stop()
-                } catch (_: Exception) {
-                }
-
-                try {
-                    track.release()
-                } catch (_: Exception) {
-                }
-
-                currentTrack = null
-                restoreOriginalVolume()
-
-                mainHandler.post {
-                    searching.set(false)
-                    startButton.isEnabled = true
-                    stopButton.isEnabled = false
-                    updateCurrentVolumeText()
-                    updateDeviceStatus()
                 }
             }
-        }.start()
+            volumeThread = thread
+            thread.start()
+        } catch (e: Exception) {
+            searching.set(false)
+            safelyReleasePlayer()
+            restoreOriginalVolume()
+            startButton.isEnabled = true
+            stopButton.isEnabled = false
+            playbackText.text = "再生状態：エラー (${e.javaClass.simpleName})"
+            Toast.makeText(
+                this,
+                "探索音を開始できませんでした：${e.javaClass.simpleName}",
+                Toast.LENGTH_LONG
+            ).show()
+        }
     }
 
-    private fun makeBeepBuffer(
-        sampleRate: Int,
-        frequencyHz: Double,
-        beepMs: Int,
-        silenceMs: Int
-    ): ShortArray {
+    private fun createSearchToneWav(): File {
+        val sampleRate = 44_100
+        val beepMs = 430
+        val silenceMs = 170
+        val sequence = doubleArrayOf(2200.0, 3200.0)
         val beepSamples = sampleRate * beepMs / 1000
         val silenceSamples = sampleRate * silenceMs / 1000
-        val result = ShortArray(beepSamples + silenceSamples)
+        val samplesPerTone = beepSamples + silenceSamples
+        val totalSamples = samplesPerTone * sequence.size
+        val pcm = ShortArray(totalSamples)
         val fadeSamples = (sampleRate * 0.015).roundToInt().coerceAtLeast(1)
 
-        for (i in 0 until beepSamples) {
-            val fadeIn = (i.toFloat() / fadeSamples).coerceIn(0f, 1f)
-            val fadeOut = ((beepSamples - i).toFloat() / fadeSamples).coerceIn(0f, 1f)
-            val envelope = minOf(fadeIn, fadeOut)
-
-            val sample = sin(2.0 * PI * frequencyHz * i / sampleRate)
-            result[i] = (sample * Short.MAX_VALUE * 0.75 * envelope).toInt().toShort()
+        sequence.forEachIndexed { toneIndex, frequencyHz ->
+            val offset = toneIndex * samplesPerTone
+            for (i in 0 until beepSamples) {
+                val fadeIn = (i.toFloat() / fadeSamples).coerceIn(0f, 1f)
+                val fadeOut = ((beepSamples - i).toFloat() / fadeSamples).coerceIn(0f, 1f)
+                val envelope = minOf(fadeIn, fadeOut)
+                val sample = sin(2.0 * PI * frequencyHz * i / sampleRate)
+                pcm[offset + i] = (sample * Short.MAX_VALUE * 0.80 * envelope).toInt().toShort()
+            }
         }
 
-        return result
+        val pcmBytes = ByteBuffer.allocate(pcm.size * 2)
+            .order(ByteOrder.LITTLE_ENDIAN)
+        pcm.forEach { pcmBytes.putShort(it) }
+        val audioData = pcmBytes.array()
+
+        val file = File(cacheDir, "search_tone.wav")
+        FileOutputStream(file).use { out ->
+            val dataSize = audioData.size
+            val byteRate = sampleRate * 2
+            val header = ByteBuffer.allocate(44).order(ByteOrder.LITTLE_ENDIAN).apply {
+                put("RIFF".toByteArray(Charsets.US_ASCII))
+                putInt(36 + dataSize)
+                put("WAVE".toByteArray(Charsets.US_ASCII))
+                put("fmt ".toByteArray(Charsets.US_ASCII))
+                putInt(16)
+                putShort(1.toShort())
+                putShort(1.toShort())
+                putInt(sampleRate)
+                putInt(byteRate)
+                putShort(2.toShort())
+                putShort(16.toShort())
+                put("data".toByteArray(Charsets.US_ASCII))
+                putInt(dataSize)
+            }.array()
+
+            out.write(header)
+            out.write(audioData)
+        }
+
+        return file
     }
 
     private fun setSystemMediaVolume(fraction: Float) {
@@ -399,25 +408,41 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun safelyReleasePlayer() {
+        val player = currentPlayer
+        currentPlayer = null
+        if (player != null) {
+            try {
+                if (player.isPlaying) player.stop()
+            } catch (_: Exception) {
+            }
+            try {
+                player.reset()
+            } catch (_: Exception) {
+            }
+            try {
+                player.release()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
     private fun stopSearchSound(message: String? = null) {
         if (!searching.getAndSet(false)) return
 
-        try {
-            currentTrack?.stop()
-        } catch (_: Exception) {
-        }
+        volumeThread?.interrupt()
+        volumeThread = null
+        safelyReleasePlayer()
+        restoreOriginalVolume()
+
+        playbackText.text = "再生状態：停止中"
+        startButton.isEnabled = true
+        stopButton.isEnabled = false
+        updateCurrentVolumeText()
+        updateDeviceStatus()
 
         if (message != null) {
-            mainHandler.post {
-                Toast.makeText(this, message, Toast.LENGTH_LONG).show()
-            }
-        }
-
-        restoreOriginalVolume()
-        mainHandler.post {
-            startButton.isEnabled = true
-            stopButton.isEnabled = false
-            updateCurrentVolumeText()
+            Toast.makeText(this, message, Toast.LENGTH_LONG).show()
         }
     }
 
